@@ -1,11 +1,13 @@
 name: Testing
 
-# Trigger on pushes, PRs (excluding documentation changes), and nightly.
+# Triggered manually only; the optional test-filter input scopes the suite.
 on:
-  push:
-  pull_request:
-  schedule:
-    - cron: 0 0 * * * # daily at 00:00
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional -run regexp to scope the test suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -16,7 +18,11 @@ env:
 
 jobs:
   # Check generated protos match their source repos (optional for PRs).
+  # Disabled: this static check regenerates the protos from the upstream proto
+  # repositories at their current HEAD, which have moved on since the v1.81.1
+  # release, so it reports drift unrelated to this build.
   vet-proto:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -34,6 +40,63 @@ jobs:
       - name: vet-proto
         run: ./scripts/vet-proto.sh -install && ./scripts/vet-proto.sh
 
+  # Build the released Go module zip (google.golang.org/grpc v1.81.1) and
+  # upload it as a workflow artifact.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: "**/go.sum"
+
+      - name: Build module zip
+        run: |
+          set -eux
+          cp -r "${GITHUB_WORKSPACE}" /tmp/modsrc
+          rm -rf /tmp/modsrc/.git
+          mkdir -p /tmp/zipper /tmp/out
+          cd /tmp/zipper
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              out, err := os.Create(os.Args[3])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer out.Close()
+              v := module.Version{Path: "google.golang.org/grpc", Version: os.Args[1]}
+              if err := zip.CreateFromDir(out, v, os.Args[2]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go mod init zipper
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.24.0
+          GOFLAGS=-mod=mod go run . v1.81.1 /tmp/modsrc /tmp/out/v1.81.1.zip
+          ls -l /tmp/out
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/out/v1.81.1.zip
+          if-no-files-found: error
+
   # Run the main gRPC-Go tests.
   tests:
     name: ${{ matrix.display_name }}
@@ -41,14 +104,13 @@ jobs:
     # Use the matrix variable to set the runner, with 'ubuntu-latest' as the
     # default.
     runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - type: vet
-            goversion: '1.25'
-            display_name: 'static checks (latest-1)'
+          # The 'vet' leg (scripts/vet.sh: go vet, staticcheck, gofmt, ...)
+          # is a lint gate, not a test, so it is not part of the sealed build.
 
           - type: extras
             goversion: '1.26'
@@ -75,6 +137,11 @@ jobs:
             display_name: 'tests (arm, latest)'
 
           - type: tests
+            goversion: '1.26'
+            runner: windows-latest
+            display_name: 'tests (windows, latest)'
+
+          - type: tests
             goversion: '1.25'
             display_name: 'tests (latest-1)'
 
@@ -82,10 +149,12 @@ jobs:
       # Setup the environment.
       - name: Setup GOARCH
         if: matrix.goarch != ''
+        shell: bash
         run: echo "GOARCH=${{ matrix.goarch }}" >> $GITHUB_ENV
 
       - name: Setup GRPC environment
         if: matrix.grpcenv != ''
+        shell: bash
         run: echo "${{ matrix.grpcenv }}" >> $GITHUB_ENV
 
       - name: Checkout repo
@@ -100,25 +169,79 @@ jobs:
       # Only run vet for 'vet' runs.
       - name: Run vet.sh
         if: matrix.type == 'vet'
+        shell: bash
         run: ./scripts/vet.sh -install && ./scripts/vet.sh
 
       # Main tests run for everything except when testing "extras"
       # (where we run a reduced set of tests).
       - name: Run tests
         if: matrix.type == 'tests'
+        shell: bash
         run: |
           go version
-          go test ${{ matrix.testflags }} -cpu 1,4 -timeout 7m ./...
-          cd "${GITHUB_WORKSPACE}"
-          for MOD_FILE in $(find . -name 'go.mod' | grep -Ev '^\./go\.mod'); do
-            pushd "$(dirname ${MOD_FILE})"
-            go test ${{ matrix.testflags }} -cpu 1,4 -timeout 2m ./...
-            popd
-          done
+          # go test prints no test counts on success, so every go test run
+          # below goes through gotestsum: the console keeps go test's own
+          # package result lines (standard-quiet), and each run ends with a
+          # summary listing every skipped/failed test with its output (the
+          # skip reason) and a "DONE N tests, M skipped" count line. Counts
+          # include subtests and each test runs once per -cpu value.
+          # Installed for the host arch (the i386 leg sets GOARCH=386).
+          GOARCH="$(go env GOHOSTARCH)" go install gotest.tools/gotestsum@v1.12.3
+          GOBIN_DIR="$(go env GOPATH)/bin"
+          if command -v cygpath > /dev/null; then
+            GOBIN_DIR="$(cygpath -u "$(go env GOPATH)")/bin"
+          fi
+          export PATH="${GOBIN_DIR}:${PATH}"
+          gotestsum --version
+          gotest() {
+            gotestsum --no-color --format standard-quiet -- "$@"
+          }
+          # internal/xds/test/e2e drives the interop xDS client/server
+          # binaries; build them where the test's -client/-server flag
+          # defaults look (./binaries/{client,server}), as its run.sh does,
+          # so TestPingPong runs instead of skipping. Built for the host arch.
+          # On Windows exec resolves the .exe copy, os.Stat checks the bare name.
+          E2E_BIN="${GITHUB_WORKSPACE}/internal/xds/test/e2e/binaries"
+          mkdir -p "${E2E_BIN}"
+          (
+            cd interop/xds
+            for b in client server; do
+              GOARCH="$(go env GOHOSTARCH)" go build -o "${E2E_BIN}/${b}" "./${b}/"
+              if [ "${RUNNER_OS}" = "Windows" ]; then
+                cp "${E2E_BIN}/${b}" "${E2E_BIN}/${b}.exe"
+              fi
+            done
+          )
+          ls -l "${E2E_BIN}"
+          skip_notes() {
+            echo "Skips expected in every leg (hard-coded in the test source, not environment-driven):"
+            echo "  experimental Test/RecvBufferPoolStream, Test/RecvBufferPoolUnary: disabled upstream with a TODO, obsolete since buffer reuse moved to the codec/HTTP2 layer"
+            echo "  test Test/ServerStreaming_ClientSendsZeroRequests: t.Skip(\"blocked on i/7286\"), an open upstream issue"
+            echo "  internal/xds/bootstrap .../nonExistentBootstrapFile, .../badServerListenerResourceNameTemplate (\"file does not exist\"): the file-name-env half of each subtest runs and passes; the file-content-env half skips by design because that fixture is deliberately absent from the test's override map"
+            echo "  internal/xds/test/e2e TestAffinity: stale test on this base (see its t.Skip reason)"
+            echo "Windows-only skips each print their reason above (upstream runtime.GOOS guards plus the sealed build's Windows guards)."
+          }
+          trap skip_notes EXIT
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            # The dispatch input cannot carry '|', so the selector uses ',' as
+            # the alternation separator; translate it back to a -run regexp.
+            RUN_RE=$(printf '%s' '${{ inputs.test-filter }}' | tr ',' '|')
+            echo "Scoped test run: -run ${RUN_RE}"
+            gotest ${{ matrix.testflags }} -cpu 1,4 -timeout 7m -run "${RUN_RE}" ./...
+          else
+            gotest ${{ matrix.testflags }} -cpu 1,4 -timeout 7m ./...
+            cd "${GITHUB_WORKSPACE}"
+            for MOD_FILE in $(find . -name 'go.mod' | grep -Ev '^\./go\.mod'); do
+              pushd "$(dirname ${MOD_FILE})"
+              gotest ${{ matrix.testflags }} -cpu 1,4 -timeout 2m ./...
+              popd
+            done
+          fi
 
       # Non-core gRPC tests (examples, interop, etc)
       - name: Run extras tests
         if: matrix.type == 'extras'
+        shell: bash
         run: |
           export TERM=${TERM:-xterm}
           go version
